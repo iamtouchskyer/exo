@@ -277,6 +277,8 @@ class ChatGPTAPI:
       response = web.StreamResponse(status=200, reason='OK', headers={ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
       await response.prepare(request)
       async for path, s in self.node.shard_downloader.get_shard_download_status(self.inference_engine_classname):
+        if (s.total_bytes - s.downloaded_bytes) / s.total_bytes <= 0.0000001:
+          s.downloaded_bytes = s.total_bytes
         model_data = { s.shard.model_id: { "downloaded": s.downloaded_bytes == s.total_bytes, "download_percentage": 100 if s.downloaded_bytes == s.total_bytes else 100 * float(s.downloaded_bytes) / float(s.total_bytes), "total_size": s.total_bytes, "total_downloaded": s.downloaded_bytes } }
         await response.write(f"data: {json.dumps(model_data)}\n\n".encode())
       await response.write(b"data: [DONE]\n\n")
