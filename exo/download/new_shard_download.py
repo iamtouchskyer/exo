@@ -11,7 +11,7 @@ import aiofiles.os as aios
 import aiohttp
 import aiofiles
 from urllib.parse import urljoin
-from typing import Callable, Union, Tuple, Dict, List, Optional, Literal, AsyncIterator
+from typing import Callable, Union, Tuple, Dict, List, Optional, Literal, AsyncIterator, Any
 import time
 from datetime import timedelta
 import asyncio
@@ -86,30 +86,45 @@ async def fetch_file_list_with_retry(repo_id: str, revision: str = "main", path:
       if attempt == n_attempts - 1: raise e
       await asyncio.sleep(min(8, 0.1 * (2 ** attempt)))
 
+def get_proxy_session_kwargs(timeout: aiohttp.ClientTimeout) -> Dict[str, Any]:
+    """
+    Creates session keyword arguments with proxy configuration.
+    
+    Args:
+        timeout: The aiohttp ClientTimeout to use
+        
+    Returns:
+        Dictionary with session configuration including proxy connector if available
+    """
+    session_kwargs = {
+        "timeout": timeout
+    }
+    
+    # Try to use proxy
+    try:
+        # Use hardcoded proxy address
+        proxy = "http://127.0.0.1:1087"
+        from aiohttp_socks import ProxyConnector
+        connector = ProxyConnector.from_url(proxy, ssl=False)
+        session_kwargs["connector"] = connector
+    except ImportError:
+        # If aiohttp_socks isn't available, proceed without proxy
+        pass
+        
+    return session_kwargs
+
 async def _fetch_file_list(repo_id: str, revision: str = "main", path: str = "") -> List[Dict[str, Union[str, int]]]:
   api_url = f"{get_hf_endpoint()}/api/models/{repo_id}/tree/{revision}"
   url = f"{api_url}/{path}" if path else api_url
 
   headers = await get_auth_headers()
-      # ========== 核心修复代码 ==========
-  from aiohttp_socks import ProxyConnector, ProxyType
-  import asyncio
   
-  # 强制使用uvloop事件循环（解决Python 3.12的TLS兼容性问题）
-  import uvloop
-  uvloop.install()
-  
-  # 创建支持HTTPS代理的连接器
-  connector = ProxyConnector(
-      proxy_type=ProxyType.HTTP,
-      host='127.0.0.1',
-      port=1087,
-      verify_ssl=False  # 禁用SSL验证（仅限开发环境）
-  )
-  async with aiohttp.ClientSession(
-      connector=connector,
+  # Create a session with configurable proxy support
+  session_kwargs = get_proxy_session_kwargs(
       timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_read=30, sock_connect=10)
-  ) as session:
+  )
+  
+  async with aiohttp.ClientSession(**session_kwargs) as session:
     async with session.get(url, headers=headers) as response:
       if response.status == 200:
         data = await response.json()
@@ -138,32 +153,34 @@ async def file_meta(repo_id: str, revision: str, path: str) -> Tuple[int, str]:
   url = urljoin(f"{get_hf_endpoint()}/{repo_id}/resolve/{revision}/", path)
   headers = await get_auth_headers()
 
-    # ========== 核心修复代码 ==========
-  from aiohttp_socks import ProxyConnector, ProxyType
-  import asyncio
-  
-  # 强制使用uvloop事件循环（解决Python 3.12的TLS兼容性问题）
-  import uvloop
-  uvloop.install()
-  
-  # 创建支持HTTPS代理的连接器
-  connector = ProxyConnector(
-      proxy_type=ProxyType.HTTP,
-      host='127.0.0.1',
-      port=1087,
-      verify_ssl=False  # 禁用SSL验证（仅限开发环境）
+  # Create session with configurable proxy and timeout
+  session_kwargs = get_proxy_session_kwargs(
+      timeout=aiohttp.ClientTimeout(total=60, connect=20, sock_read=60, sock_connect=20)
   )
-  async with aiohttp.ClientSession(
-      connector=connector,
-      timeout=aiohttp.ClientTimeout(total=1800, connect=60, sock_read=1800, sock_connect=60)
-  ) as session:
-    async with session.head(url, headers=headers) as r:
-      content_length = int(r.headers.get('x-linked-size') or r.headers.get('content-length') or 0)
-      etag = r.headers.get('X-Linked-ETag') or r.headers.get('ETag') or r.headers.get('Etag')
-      assert content_length > 0, f"No content length for {url}"
-      assert etag is not None, f"No remote hash for {url}"
-      if  (etag[0] == '"' and etag[-1] == '"') or (etag[0] == "'" and etag[-1] == "'"): etag = etag[1:-1]
-      return content_length, etag
+      
+  async with aiohttp.ClientSession(**session_kwargs) as session:
+    try:
+      async with session.head(url, headers=headers) as r:
+        content_length = int(r.headers.get('x-linked-size') or r.headers.get('content-length') or 0)
+        etag = r.headers.get('X-Linked-ETag') or r.headers.get('ETag') or r.headers.get('Etag')
+        assert content_length > 0, f"No content length for {url}"
+        assert etag is not None, f"No remote hash for {url}"
+        if (etag[0] == '"' and etag[-1] == '"') or (etag[0] == "'" and etag[-1] == "'"): etag = etag[1:-1]
+        return content_length, etag
+    except (aiohttp.ClientConnectorError, ConnectionResetError) as e:
+      # Try direct connection if proxy fails
+      if "connector" in session_kwargs:
+        print(f"Proxy connection failed for {url}, trying direct connection")
+        async with aiohttp.ClientSession(timeout=session_kwargs["timeout"]) as direct_session:
+          async with direct_session.head(url, headers=headers) as r:
+            content_length = int(r.headers.get('x-linked-size') or r.headers.get('content-length') or 0)
+            etag = r.headers.get('X-Linked-ETag') or r.headers.get('ETag') or r.headers.get('Etag')
+            assert content_length > 0, f"No content length for {url}"
+            assert etag is not None, f"No remote hash for {url}"
+            if (etag[0] == '"' and etag[-1] == '"') or (etag[0] == "'" and etag[-1] == "'"): etag = etag[1:-1]
+            return content_length, etag
+      else:
+        raise
 
 async def download_file_with_retry(repo_id: str, revision: str, path: str, target_dir: Path, on_progress: Callable[[int, int], None] = lambda _, __: None) -> Path:
   n_attempts = 30
@@ -188,31 +205,35 @@ async def _download_file(repo_id: str, revision: str, path: str, target_dir: Pat
     if resume_byte_pos: headers['Range'] = f'bytes={resume_byte_pos}-'
     n_read = resume_byte_pos or 0
 
-    # ========== 核心修复代码 ==========
-    from aiohttp_socks import ProxyConnector, ProxyType
-    import asyncio
-    
-    # 强制使用uvloop事件循环（解决Python 3.12的TLS兼容性问题）
-    import uvloop
-    uvloop.install()
-    
-    # 创建支持HTTPS代理的连接器
-    connector = ProxyConnector(
-        proxy_type=ProxyType.HTTP,
-        host='127.0.0.1',
-        port=1087,
-        verify_ssl=False  # 禁用SSL验证（仅限开发环境）
+    # Create session with configurable proxy and timeout
+    session_kwargs = get_proxy_session_kwargs(
+        timeout=aiohttp.ClientTimeout(total=1800, connect=60, sock_read=1800, sock_connect=60)
     )
     
-    async with aiohttp.ClientSession(
-        connector=connector,
-        timeout=aiohttp.ClientTimeout(total=1800, connect=60, sock_read=1800, sock_connect=60)
-    ) as session:
-      async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=1800, connect=60, sock_read=1800, sock_connect=60)) as r:
-        if r.status == 404: raise FileNotFoundError(f"File not found: {url}")
-        assert r.status in [200, 206], f"Failed to download {path} from {url}: {r.status}"
-        async with aiofiles.open(partial_path, 'ab' if resume_byte_pos else 'wb') as f:
-          while chunk := await r.content.read(8 * 1024 * 1024): on_progress(n_read := n_read + await f.write(chunk), length)
+    # First try with proxy if configured
+    try:
+      async with aiohttp.ClientSession(**session_kwargs) as session:
+        async with session.get(url, headers=headers) as r:
+          if r.status == 404: raise FileNotFoundError(f"File not found: {url}")
+          assert r.status in [200, 206], f"Failed to download {path} from {url}: {r.status}"
+          async with aiofiles.open(partial_path, 'ab' if resume_byte_pos else 'wb') as f:
+            while chunk := await r.content.read(8 * 1024 * 1024): 
+              on_progress(n_read := n_read + await f.write(chunk), length)
+    except (aiohttp.ClientConnectorError, ConnectionResetError) as e:
+      # If proxy fails, try direct connection
+      if "connector" in session_kwargs:
+        print(f"Proxy download failed for {url}, trying direct connection")
+        async with aiohttp.ClientSession(timeout=session_kwargs["timeout"]) as direct_session:
+          async with direct_session.get(url, headers=headers) as r:
+            if r.status == 404: raise FileNotFoundError(f"File not found: {url}")
+            assert r.status in [200, 206], f"Failed to download {path} from {url}: {r.status}"
+            # Start over with a fresh file when switching to direct download
+            async with aiofiles.open(partial_path, 'wb') as f:
+              n_read = 0
+              while chunk := await r.content.read(8 * 1024 * 1024):
+                on_progress(n_read := n_read + await f.write(chunk), length)
+      else:
+        raise
 
   final_hash = await calc_hash(partial_path, type="sha256" if len(remote_hash) == 64 else "sha1")
   integrity = final_hash == remote_hash
