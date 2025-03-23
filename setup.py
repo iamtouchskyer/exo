@@ -7,6 +7,7 @@ from setuptools import find_packages, setup
 # Base requirements for all platforms
 install_requires = [
   "aiohttp==3.10.11",
+  "aiohttp-socks>=0.8.0",  # 支持 SOCKS 代理的扩展
   "aiohttp_cors==0.7.0",
   "aiofiles==24.1.0",
   "grpcio==1.70.0",

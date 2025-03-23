@@ -20,6 +20,7 @@ import traceback
 import shutil
 import tempfile
 import hashlib
+from aiohttp_socks import ProxyConnector
 
 def exo_home() -> Path:
   return Path(os.environ.get("EXO_HOME", Path.home()/".cache"/"exo"))
@@ -86,58 +87,84 @@ async def fetch_file_list_with_retry(repo_id: str, revision: str = "main", path:
       if attempt == n_attempts - 1: raise e
       await asyncio.sleep(min(8, 0.1 * (2 ** attempt)))
 
-def get_proxy_session_kwargs(timeout: aiohttp.ClientTimeout) -> Dict[str, Any]:
+def get_proxy_session_kwargs(timeout: aiohttp.ClientTimeout, url: str = "") -> Dict[str, Any]:
     """
-    Creates session keyword arguments with proxy configuration.
+    Creates session keyword arguments with proxy configuration from environment variables.
     
     Args:
         timeout: The aiohttp ClientTimeout to use
+        url: The URL being requested, used to determine which proxy to use
         
     Returns:
-        Dictionary with session configuration including proxy connector if available
+        Dictionary with session configuration including proxy if HTTP_PROXY/HTTPS_PROXY is set
     """
     session_kwargs = {
         "timeout": timeout
     }
     
-    # Try to use proxy
     try:
-        # Use hardcoded proxy address
-        proxy = "http://127.0.0.1:1087"
-        from aiohttp_socks import ProxyConnector
-        connector = ProxyConnector.from_url(proxy, ssl=False)
-        session_kwargs["connector"] = connector
-    except ImportError:
-        # If aiohttp_socks isn't available, proceed without proxy
-        pass
+        # 确定使用哪个代理
+        is_https = url.startswith("https://")
         
+        # 按优先级检查代理设置
+        proxy = None
+        if is_https:
+            proxy = (os.environ.get("HTTPS_PROXY") or 
+                    os.environ.get("https_proxy") or 
+                    os.environ.get("HTTP_PROXY") or 
+                    os.environ.get("http_proxy"))
+        else:
+            proxy = (os.environ.get("HTTP_PROXY") or 
+                    os.environ.get("http_proxy"))
+        
+        print(f"Proxy={proxy}")
+        if proxy:
+            print(f"proxy={proxy}")
+
+            print(f"Using {'HTTPS' if is_https else 'HTTP'} proxy from environment: {proxy}")
+            print(f"aaaaaaaaaproxy={proxy}")
+            connector = ProxyConnector.from_url(
+                proxy,
+                ssl=False,  # Disable SSL verification
+                force_close=True,  # Force close connections
+                enable_cleanup_closed=True  # Clean up closed connections
+            )
+            session_kwargs["connector"] = connector
+            
+    except ImportError:
+        if DEBUG >= 2:
+            print("aiohttp_socks not available, proceeding without proxy")
+    except Exception as e:
+        if DEBUG >= 2:
+            print(f"Error configuring proxy: {e}")
+            traceback.print_exc()
+            
     return session_kwargs
 
 async def _fetch_file_list(repo_id: str, revision: str = "main", path: str = "") -> List[Dict[str, Union[str, int]]]:
-  api_url = f"{get_hf_endpoint()}/api/models/{repo_id}/tree/{revision}"
-  url = f"{api_url}/{path}" if path else api_url
+    api_url = f"{get_hf_endpoint()}/api/models/{repo_id}/tree/{revision}"
+    url = f"{api_url}/{path}" if path else api_url
 
-  headers = await get_auth_headers()
-  
-  # Create a session with configurable proxy support
-  session_kwargs = get_proxy_session_kwargs(
-      timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_read=30, sock_connect=10)
-  )
-  
-  async with aiohttp.ClientSession(**session_kwargs) as session:
-    async with session.get(url, headers=headers) as response:
-      if response.status == 200:
-        data = await response.json()
-        files = []
-        for item in data:
-          if item["type"] == "file":
-            files.append({"path": item["path"], "size": item["size"]})
-          elif item["type"] == "directory":
-            subfiles = await _fetch_file_list(repo_id, revision, item["path"])
-            files.extend(subfiles)
-        return files
-      else:
-        raise Exception(f"Failed to fetch file list: {response.status}")
+    headers = await get_auth_headers()
+    session_kwargs = get_proxy_session_kwargs(
+        timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_read=30, sock_connect=10),
+        url=url
+    )
+    
+    async with aiohttp.ClientSession(**session_kwargs) as session:
+        async with session.get(url, headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
+                files = []
+                for item in data:
+                    if item["type"] == "file":
+                        files.append({"path": item["path"], "size": item["size"]})
+                    elif item["type"] == "directory":
+                        subfiles = await _fetch_file_list(repo_id, revision, item["path"])
+                        files.extend(subfiles)
+                return files
+            else:
+                raise Exception(f"Failed to fetch file list: {response.status}")
 
 async def calc_hash(path: Path, type: Literal["sha1", "sha256"] = "sha1") -> str:
   hash = hashlib.sha1() if type == "sha1" else hashlib.sha256()
@@ -150,37 +177,39 @@ async def calc_hash(path: Path, type: Literal["sha1", "sha256"] = "sha1") -> str
   return hash.hexdigest()
 
 async def file_meta(repo_id: str, revision: str, path: str) -> Tuple[int, str]:
-  url = urljoin(f"{get_hf_endpoint()}/{repo_id}/resolve/{revision}/", path)
-  headers = await get_auth_headers()
-
-  # Create session with configurable proxy and timeout
-  session_kwargs = get_proxy_session_kwargs(
-      timeout=aiohttp.ClientTimeout(total=60, connect=20, sock_read=60, sock_connect=20)
-  )
-      
-  async with aiohttp.ClientSession(**session_kwargs) as session:
-    try:
-      async with session.head(url, headers=headers) as r:
-        content_length = int(r.headers.get('x-linked-size') or r.headers.get('content-length') or 0)
-        etag = r.headers.get('X-Linked-ETag') or r.headers.get('ETag') or r.headers.get('Etag')
-        assert content_length > 0, f"No content length for {url}"
-        assert etag is not None, f"No remote hash for {url}"
-        if (etag[0] == '"' and etag[-1] == '"') or (etag[0] == "'" and etag[-1] == "'"): etag = etag[1:-1]
-        return content_length, etag
-    except (aiohttp.ClientConnectorError, ConnectionResetError) as e:
-      # Try direct connection if proxy fails
-      if "connector" in session_kwargs:
-        print(f"Proxy connection failed for {url}, trying direct connection")
-        async with aiohttp.ClientSession(timeout=session_kwargs["timeout"]) as direct_session:
-          async with direct_session.head(url, headers=headers) as r:
-            content_length = int(r.headers.get('x-linked-size') or r.headers.get('content-length') or 0)
-            etag = r.headers.get('X-Linked-ETag') or r.headers.get('ETag') or r.headers.get('Etag')
-            assert content_length > 0, f"No content length for {url}"
-            assert etag is not None, f"No remote hash for {url}"
-            if (etag[0] == '"' and etag[-1] == '"') or (etag[0] == "'" and etag[-1] == "'"): etag = etag[1:-1]
-            return content_length, etag
-      else:
-        raise
+    url = urljoin(f"{get_hf_endpoint()}/{repo_id}/resolve/{revision}/", path)
+    headers = await get_auth_headers()
+    
+    session_kwargs = get_proxy_session_kwargs(
+        timeout=aiohttp.ClientTimeout(total=60, connect=20, sock_read=60, sock_connect=20),
+        url=url
+    )
+    
+    async with aiohttp.ClientSession(**session_kwargs) as session:
+        try:
+            async with session.head(url, headers=headers) as r:
+                content_length = int(r.headers.get('x-linked-size') or r.headers.get('content-length') or 0)
+                etag = r.headers.get('X-Linked-ETag') or r.headers.get('ETag') or r.headers.get('Etag')
+                assert content_length > 0, f"No content length for {url}"
+                assert etag is not None, f"No remote hash for {url}"
+                if (etag[0] == '"' and etag[-1] == '"') or (etag[0] == "'" and etag[-1] == "'"): etag = etag[1:-1]
+                return content_length, etag
+        except (aiohttp.ClientConnectorError, ConnectionResetError, TimeoutError) as e:
+            if DEBUG >= 2:
+                print(f"Error with proxy connection: {e}")
+            # Try direct connection if proxy fails
+            if "connector" in session_kwargs:
+                print(f"Proxy connection failed for {url}, trying direct connection")
+                async with aiohttp.ClientSession(timeout=session_kwargs["timeout"]) as direct_session:
+                    async with direct_session.head(url, headers=headers) as r:
+                        content_length = int(r.headers.get('x-linked-size') or r.headers.get('content-length') or 0)
+                        etag = r.headers.get('X-Linked-ETag') or r.headers.get('ETag') or r.headers.get('Etag')
+                        assert content_length > 0, f"No content length for {url}"
+                        assert etag is not None, f"No remote hash for {url}"
+                        if (etag[0] == '"' and etag[-1] == '"') or (etag[0] == "'" and etag[-1] == "'"): etag = etag[1:-1]
+                        return content_length, etag
+            else:
+                raise
 
 async def download_file_with_retry(repo_id: str, revision: str, path: str, target_dir: Path, on_progress: Callable[[int, int], None] = lambda _, __: None) -> Path:
   n_attempts = 30
@@ -193,56 +222,57 @@ async def download_file_with_retry(repo_id: str, revision: str, path: str, targe
       await asyncio.sleep(min(8, 0.1 * (2 ** attempt)))
 
 async def _download_file(repo_id: str, revision: str, path: str, target_dir: Path, on_progress: Callable[[int, int], None] = lambda _, __: None) -> Path:
-  if await aios.path.exists(target_dir/path): return target_dir/path
-  await aios.makedirs((target_dir/path).parent, exist_ok=True)
-  length, etag = await file_meta(repo_id, revision, path)
-  remote_hash = etag[:-5] if etag.endswith("-gzip") else etag
-  partial_path = target_dir/f"{path}.partial"
-  resume_byte_pos = (await aios.stat(partial_path)).st_size if (await aios.path.exists(partial_path)) else None
-  if resume_byte_pos != length:
-    url = urljoin(f"{get_hf_endpoint()}/{repo_id}/resolve/{revision}/", path)
-    headers = await get_auth_headers()
-    if resume_byte_pos: headers['Range'] = f'bytes={resume_byte_pos}-'
-    n_read = resume_byte_pos or 0
-
-    # Create session with configurable proxy and timeout
-    session_kwargs = get_proxy_session_kwargs(
-        timeout=aiohttp.ClientTimeout(total=1800, connect=60, sock_read=1800, sock_connect=60)
-    )
+    if await aios.path.exists(target_dir/path): return target_dir/path
+    await aios.makedirs((target_dir/path).parent, exist_ok=True)
+    length, etag = await file_meta(repo_id, revision, path)
+    remote_hash = etag[:-5] if etag.endswith("-gzip") else etag
+    partial_path = target_dir/f"{path}.partial"
+    resume_byte_pos = (await aios.stat(partial_path)).st_size if (await aios.path.exists(partial_path)) else None
     
-    # First try with proxy if configured
-    try:
-      async with aiohttp.ClientSession(**session_kwargs) as session:
-        async with session.get(url, headers=headers) as r:
-          if r.status == 404: raise FileNotFoundError(f"File not found: {url}")
-          assert r.status in [200, 206], f"Failed to download {path} from {url}: {r.status}"
-          async with aiofiles.open(partial_path, 'ab' if resume_byte_pos else 'wb') as f:
-            while chunk := await r.content.read(8 * 1024 * 1024): 
-              on_progress(n_read := n_read + await f.write(chunk), length)
-    except (aiohttp.ClientConnectorError, ConnectionResetError) as e:
-      # If proxy fails, try direct connection
-      if "connector" in session_kwargs:
-        print(f"Proxy download failed for {url}, trying direct connection")
-        async with aiohttp.ClientSession(timeout=session_kwargs["timeout"]) as direct_session:
-          async with direct_session.get(url, headers=headers) as r:
-            if r.status == 404: raise FileNotFoundError(f"File not found: {url}")
-            assert r.status in [200, 206], f"Failed to download {path} from {url}: {r.status}"
-            # Start over with a fresh file when switching to direct download
-            async with aiofiles.open(partial_path, 'wb') as f:
-              n_read = 0
-              while chunk := await r.content.read(8 * 1024 * 1024):
-                on_progress(n_read := n_read + await f.write(chunk), length)
-      else:
-        raise
+    if resume_byte_pos != length:
+        url = urljoin(f"{get_hf_endpoint()}/{repo_id}/resolve/{revision}/", path)
+        headers = await get_auth_headers()
+        if resume_byte_pos: headers['Range'] = f'bytes={resume_byte_pos}-'
+        n_read = resume_byte_pos or 0
 
-  final_hash = await calc_hash(partial_path, type="sha256" if len(remote_hash) == 64 else "sha1")
-  integrity = final_hash == remote_hash
-  if not integrity:
-    try: await aios.remove(partial_path)
-    except Exception as e: print(f"Error removing partial file {partial_path}: {e}")
-    raise Exception(f"Downloaded file {target_dir/path} has hash {final_hash} but remote hash is {remote_hash}")
-  await aios.rename(partial_path, target_dir/path)
-  return target_dir/path
+        session_kwargs = get_proxy_session_kwargs(
+            timeout=aiohttp.ClientTimeout(total=1800, connect=60, sock_read=1800, sock_connect=60),
+            url=url
+        )
+        
+        try:
+            async with aiohttp.ClientSession(**session_kwargs) as session:
+                async with session.get(url, headers=headers) as r:
+                    if r.status == 404: raise FileNotFoundError(f"File not found: {url}")
+                    assert r.status in [200, 206], f"Failed to download {path} from {url}: {r.status}"
+                    async with aiofiles.open(partial_path, 'ab' if resume_byte_pos else 'wb') as f:
+                        while chunk := await r.content.read(8 * 1024 * 1024):
+                            on_progress(n_read := n_read + await f.write(chunk), length)
+        except (aiohttp.ClientConnectorError, ConnectionResetError, TimeoutError) as e:
+            if DEBUG >= 2:
+                print(f"Error with proxy connection: {e}")
+            # Try direct connection if proxy fails
+            if "connector" in session_kwargs:
+                print(f"Proxy connection failed for {url}, trying direct connection")
+                async with aiohttp.ClientSession(timeout=session_kwargs["timeout"]) as direct_session:
+                    async with direct_session.get(url, headers=headers) as r:
+                        if r.status == 404: raise FileNotFoundError(f"File not found: {url}")
+                        assert r.status in [200, 206], f"Failed to download {path} from {url}: {r.status}"
+                        async with aiofiles.open(partial_path, 'wb') as f:
+                            n_read = 0
+                            while chunk := await r.content.read(8 * 1024 * 1024):
+                                on_progress(n_read := n_read + await f.write(chunk), length)
+            else:
+                raise
+
+    final_hash = await calc_hash(partial_path, type="sha256" if len(remote_hash) == 64 else "sha1")
+    integrity = final_hash == remote_hash
+    if not integrity:
+        try: await aios.remove(partial_path)
+        except Exception as e: print(f"Error removing partial file {partial_path}: {e}")
+        raise Exception(f"Downloaded file {target_dir/path} has hash {final_hash} but remote hash is {remote_hash}")
+    await aios.rename(partial_path, target_dir/path)
+    return target_dir/path
 
 
 def calculate_repo_progress(shard: Shard, repo_id: str, revision: str, file_progress: Dict[str, RepoFileProgressEvent], all_start_time: float) -> RepoProgressEvent:
