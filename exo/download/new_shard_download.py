@@ -89,51 +89,34 @@ async def fetch_file_list_with_retry(repo_id: str, revision: str = "main", path:
 
 def get_proxy_session_kwargs(timeout: aiohttp.ClientTimeout, url: str = "") -> Dict[str, Any]:
     """
-    Creates session keyword arguments with proxy configuration from environment variables.
+    Creates session keyword arguments with hardcoded proxy configuration.
     
     Args:
         timeout: The aiohttp ClientTimeout to use
-        url: The URL being requested, used to determine which proxy to use
+        url: The URL being requested (not used in hardcoded version)
         
     Returns:
-        Dictionary with session configuration including proxy if HTTP_PROXY/HTTPS_PROXY is set
+        Dictionary with session configuration including proxy
     """
     session_kwargs = {
         "timeout": timeout
     }
     
     try:
-        # 确定使用哪个代理
-        is_https = url.startswith("https://")
+        # 直接使用硬编码的代理地址
+        proxy = "http://127.0.0.1:1087"
         
-        # 按优先级检查代理设置
-        proxy = None
-        if is_https:
-            proxy = (os.environ.get("HTTPS_PROXY") or 
-                    os.environ.get("https_proxy") or 
-                    os.environ.get("HTTP_PROXY") or 
-                    os.environ.get("http_proxy"))
-        else:
-            proxy = (os.environ.get("HTTP_PROXY") or 
-                    os.environ.get("http_proxy"))
-        
-        print(f"Proxy={proxy}")
-        if proxy:
-            print(f"proxy={proxy}")
-
-            print(f"Using {'HTTPS' if is_https else 'HTTP'} proxy from environment: {proxy}")
-            print(f"aaaaaaaaaproxy={proxy}")
-            connector = ProxyConnector.from_url(
-                proxy,
-                ssl=False,  # Disable SSL verification
-                force_close=True,  # Force close connections
-                enable_cleanup_closed=True  # Clean up closed connections
-            )
-            session_kwargs["connector"] = connector
-            
-    except ImportError:
         if DEBUG >= 2:
-            print("aiohttp_socks not available, proceeding without proxy")
+            print(f"Using proxy: {proxy}")
+            
+        connector = ProxyConnector.from_url(
+            proxy,
+            ssl=False,  # Disable SSL verification
+            force_close=True,  # Force close connections
+            enable_cleanup_closed=True  # Clean up closed connections
+        )
+        session_kwargs["connector"] = connector
+            
     except Exception as e:
         if DEBUG >= 2:
             print(f"Error configuring proxy: {e}")
